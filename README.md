@@ -3,7 +3,8 @@
 Source of `DanteDevilTrigger.dll`, the SKSE plugin of
 [Dante's Devil Trigger](https://www.nexusmods.com/skyrimspecialedition/mods/103644) on Nexus Mods (version 2.0).
 The plugin implements the mod natively (no Papyrus scripts): Devil Trigger / Sin Devil Trigger transformations,
-the costume, the magicka cost, the Luce, and the shout and its words on game load.
+magicka cost, customizable buffs (SKSEmenu entry added), and the shout and its words on game load. 'The Luce' 
+scripts in the original were needed for YRM's Devil Sword Dante moveset and have also been ported.
 
 The DLL alone does nothing: it looks up forms in `OmecaOneDanteSDT.esp`, which ships with the Nexus release
 together with the meshes, textures, sounds, Open Animation Replacer sections and `OmecaOneDanteSDT.ini`.
