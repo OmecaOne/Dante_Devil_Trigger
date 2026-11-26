@@ -95,7 +95,8 @@ namespace
 		{ 1, "voicebonus", "Shout cooldown x##sdt", "0.2 = a fifth of the cooldown. " "Applies at the next transformation.", 0.0f, 1.0f, "%.2f", 0.2f },
 		{ 1, "nofalldmg", "No fall damage##sdt", "", 0.0f, 1.0f, nullptr, 1.0f },
 		{ 1, "waterwalking", "Water walking##sdt", "", 0.0f, 1.0f, nullptr, 1.0f },
-		{ 1, "holdtime", "Shout hold time for SDT (s)##sdt", "Hold the Devil Trigger shout this long for SDT; a shorter tap gives DT.", 0.05f, 1.5f, "%.2f", 0.25f },
+		{ 1, "holdtime", "Shout hold time (s)##sdt", "Hold the Devil Trigger shout this long for a hold, a shorter press is a tap. "
+			"Base: tap DT, hold SDT. DT: tap off, hold SDT. SDT: tap DT, hold off.", 0.05f, 1.0f, "%.2f", 0.25f },
 		{ 1, "scale", "SDT size##sdt", "Size factor while in SDT (1.10 = 10 % larger). Applies at the next SDT transformation.",
 			Transform::kSdtScaleMin, Transform::kSdtScaleMax, "%.2f", 1.1f },
 	};

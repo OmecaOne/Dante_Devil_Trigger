@@ -56,9 +56,9 @@ namespace
 		RE::TESShout*       shoutA = nullptr;        // dsdtshoutA (DT): taken off the player
 		RE::TESShout*       shoutB = nullptr;        // dsdtshoutB (SDT): taken off the player
 		RE::TESWordOfPower* words[3]{};              // dsdtword1..3: shout C's words
-		RE::TESShout*       shoutC = nullptr;        // dsdtshoutC: tap = DT toggle, hold = SDT toggle
-		RE::EffectSetting*  hold = nullptr;          // dsdtholdMGEF: shout C held past its second word (OAR picks SDT by it)
-		RE::SpellItem*      holdSpell = nullptr;     // dsdtholdSP
+		RE::TESShout*       shoutC = nullptr;        // dsdtshoutC: tap / hold, the transition picked from the player's mode
+		RE::EffectSetting*  request[4]{};            // dsdtreqDTon/DToff/SDTon/SDToffMGEF: the clip the player's press asks for (OAR)
+		RE::SpellItem*      requestSpell[4]{};       // dsdtreq...SP
 	} g;
 
 	bool g_ready = false;  // all required forms found; every hook and sink does nothing until then
@@ -618,21 +618,25 @@ namespace
 
 	// ===== Tap / hold shout =====
 	//
-	// Shout C has three words. While the player holds the shout key with shout C equipped, the hold marker is cast once the key
-	// has been held for sdtholdtime (INI, default 0.25 s); the OAR sections then pick SDT (held) or DT (tapped) when the exhale clip
-	// starts. The engine releases on its own at the last word (fShoutTime2, 0.45 s), after the marker. One transformation per press:
-	// ShoutClipAllowed.
-	// A new press clears an old marker; the clip's end clears it too (ClipEnded); its 5 s duration is the fallback.
+	// State-based (2026-11-26, user design): every press of the shout key with shout C equipped picks the transition from the
+	// player's mode at that moment (TransitionFor): SDT: tap -> DT, hold -> base; DT: tap -> base, hold -> SDT; neither: tap -> DT,
+	// hold -> SDT. The DLL casts that clip's request marker at the press (tap) and swaps it once the key has been held for
+	// sdtholdtime (INI, default 0.25 s; capped below the engine's own release at the last word, fShoutTime2 0.45 s: HoldSeconds).
+	// Each OAR section plays for the player's shout C only with its own request, and the stage + VFX follow the request, not the
+	// clip's on/off toggle. A press while a transformation clip plays after its stage ran ends that clip (CutClipForPress) and its
+	// request waits for the clip's end; a press before the stage ran is ignored. One transformation per press: ShoutClipAllowed.
+	// Input: ShoutHandler::CanProcess hook (runs before the handler, on the input thread); requests and clips: main thread.
 
-	// one transformation per key press: holding the key past the last word made the engine release the shout and,
-	// with 0 s recovery, start the next one while the key was still down (base -> SDT -> DT -> ... cycling; SDT followed by DT).
 	std::atomic<bool>          g_keyDown{ false };   // the player holds the shout key (shout C equipped)
-	std::atomic<std::uint32_t> g_press{ 0 };         // bumped on every press
+	std::atomic<std::uint32_t> g_press{ 0 };         // bumped on every press that isn't ignored
 	std::atomic<std::uint32_t> g_pressFired{ UINT32_MAX };  // the press that already started a transformation clip
-	// The player's ShoutHandler gets no "held" events of the shout button until it is released (ShoutHandlerCanProcess), so the
-	// engine can't start the next shout. (A long voice recovery while the key is down instead cut both SDT clips ~0.3 s in.)
-	std::atomic<bool>          g_blocking{ false };
-	float                      g_holdSeconds = 0.25f;
+	// The player's transformation clip is playing (marker on) / its stage has already run. Once the stage ran, a new press cuts
+	// the clip (CutClipForPress); a press before that is ignored.
+	std::atomic<bool>          g_playerClip{ false };
+	std::atomic<bool>          g_playerClipFired{ false };
+	std::atomic<bool>          g_deadPress{ false };  // pressed while a transformation clip plays before its stage: ignored
+	bool                       g_marked = false;      // input thread: the current press is decided (held to the threshold or released)
+	std::atomic<float>         g_holdSeconds{ 0.25f };  // INI sdtholdtime (menu changes apply at once)
 
 	// main thread: a transformation clip of the player's shout C started; false = a second shout of the same key press (ignored)
 	bool ShoutClipAllowed(RE::Actor* a_actor, const char* a_clipName)
@@ -646,81 +650,14 @@ namespace
 			return false;
 		}
 		g_pressFired = press;
-		if (g_keyDown) {
-			g_blocking = true;
-			REX::INFO("hold shout: key still down at the {} clip; shout input blocked until it is released", a_clipName);
-		}
 		return true;
 	}
 
-	// seconds held for SDT (INI sdtholdtime); the first call logs the engine's own shout thresholds for comparison
-	float HoldSeconds()
-	{
-		static const float seconds = []() {
-			auto* setting = RE::GameSettingCollection::GetSingleton()->GetSetting("fShoutTime1");
-			auto* setting2 = RE::GameSettingCollection::GetSingleton()->GetSetting("fShoutTime2");
-			const float t1 = setting ? setting->GetFloat() : -1.0f;
-			const float t2 = setting2 ? setting2->GetFloat() : -1.0f;
-			// fShoutTime1 (0.1 s on 1.7.104) is shorter than a quick tap (0.04-0.10 s measured): own threshold (INI sdtholdtime)
-			REX::INFO("transform: hold shout: fShoutTime1 {:.3f}, fShoutTime2 {:.3f}; SDT after {:.3f} s held (INI sdtholdtime)", t1, t2,
-				g_holdSeconds);
-			return g_holdSeconds;
-		}();
-		return seconds;
-	}
+	// seconds held for a hold (INI sdtholdtime; any thread). No engine cap: shout C no longer goes through the engine's shout,
+	// whose auto-release at the last word (fShoutTime2 0.45 s) made any threshold above ~0.35 s give DT.
+	float HoldSeconds() { return std::clamp(g_holdSeconds.load(), 0.05f, 1.5f); }
 
-	// shout button with shout C equipped: press = new press (old hold marker dispelled), held long enough = hold marker, release
-	class InputSink final : public RE::BSTEventSink<RE::InputEvent*>
-	{
-	public:
-		static InputSink* GetSingleton()
-		{
-			static InputSink sink;
-			return &sink;
-		}
-
-		RE::BSEventNotifyControl ProcessEvent(RE::InputEvent* const* a_event, RE::BSTEventSource<RE::InputEvent*>*) override
-		{
-			if (!g_ready || !a_event) {
-				return RE::BSEventNotifyControl::kContinue;
-			}
-			const auto& shoutEvent = RE::UserEvents::GetSingleton()->shout;
-			for (auto* e = *a_event; e; e = e->next) {
-				auto* button = e->AsButtonEvent();
-				if (!button || button->QUserEvent() != shoutEvent) {
-					continue;
-				}
-				auto* player = RE::PlayerCharacter::GetSingleton();
-				if (!player || player->selectedPower != g.shoutC) {
-					continue;
-				}
-				const float held = button->HeldDuration();
-				if (button->IsDown()) {
-					marked = false;
-					++g_press;
-					g_keyDown = true;
-					g_blocking = false;  // a new press: the old one was released (even if its up event went to a menu)
-					SKSE::GetTaskInterface()->AddTask([]() { DispelAll(RE::PlayerCharacter::GetSingleton(), g.hold); });
-				} else if (button->IsHeld() && !marked && held >= HoldSeconds()) {
-					marked = true;
-					REX::INFO("hold shout: held {:.2f} s -> SDT marker", held);
-					SKSE::GetTaskInterface()->AddTask([]() {
-						if (auto* p = RE::PlayerCharacter::GetSingleton()) {
-							Cast(p, g.holdSpell);
-						}
-					});
-				} else if (button->IsUp()) {
-					g_keyDown = false;
-					REX::INFO("hold shout: released after {:.2f} s ({})", held, marked ? "SDT" : "DT");
-					g_blocking = false;
-				}
-			}
-			return RE::BSEventNotifyControl::kContinue;
-		}
-
-	private:
-		bool marked = false;  // input thread only
-	};
+	void LogHoldSeconds(const char* a_why) { REX::INFO("hold shout ({}): hold after {:.2f} s (INI sdtholdtime)", a_why, HoldSeconds()); }
 
 	// ===== Clips (trigger) =====
 	//
@@ -738,12 +675,15 @@ namespace
 	constexpr const char* kClipName[4] = { "DT on", "DT off", "SDT on", "SDT off" };
 	constexpr int         kPayloadMs[4] = { 167, 33, 1900, 17 };  // the old PIE.$Dante... annotation times
 
-	// the actor's current transformation clip; token tells a restarted clip from the old one, fired = its payload ran
+	// the actor's current transformation clip; token tells a restarted clip from the old one, fired = its payload ran,
+	// request = the player's shout C clip asked for by a press (stage and VFX follow the request)
 	struct ClipState
 	{
 		int           clip = -1;
 		std::uint32_t token = 0;
 		bool          fired = false;
+		bool          request = false;
+		std::uint32_t press = 0;  // the press whose request it played (request only)
 	};
 	std::unordered_map<RE::FormID, ClipState> g_clips;  // main thread
 	std::uint32_t                             g_clipToken = 0;
@@ -763,29 +703,151 @@ namespace
 		});
 	}
 
-	// the payloads of the old Payload Interpreter config (DanteDevilTrigger.ini), with the trigger spell replaced by the stage;
-	// on/off is chosen like the trigger spells' conditions did (an ON clip while already in that mode turns it off)
-	void RunPayload(RE::Actor* a_actor, int a_clip)
+	void DTOnVFX(RE::Actor* a_actor)
+	{
+		Cast(a_actor, g.vfx2);
+		RE::ShakeCamera(0.5f, a_actor->GetPosition(), 0.5f);
+		Cast(a_actor, g.vfxExp);
+	}
+
+	void SDTOnVFX(RE::Actor* a_actor)
 	{
 		const auto id = a_actor->GetFormID();
+		Cast(a_actor, g.vfx1);
+		CastLater(id, 400, g.vfx2, 1.0f);
+		CastLater(id, 700, g.vfxExp);
+		CastLater(id, 1000, g.vfx3);
+	}
+
+	const char* ModeName(int a_mode) { return a_mode == 0 ? "DT" : a_mode == 1 ? "SDT" : "base"; }
+
+	// the payloads of the old Payload Interpreter config (DanteDevilTrigger.ini), with the trigger spell replaced by the stage.
+	// A requested clip (player, shout C) does exactly its transition; other clips (NPCs, shouts A/B) toggle like the old trigger
+	// spells' conditions did (an ON clip while already in that mode turns it off).
+	void RunPayload(RE::Actor* a_actor, int a_clip, bool a_request)
+	{
+		const int mode = ModeOf(a_actor);
+		if (a_request) {
+			if ((a_clip == kDTOn && mode == 0) || (a_clip == kSDTOn && mode == 1) || ((a_clip == kDTOff || a_clip == kSDTOff) && mode < 0)) {
+				REX::INFO("{}: requested {} clip, but the mode is already {}; no stage", Name(a_actor), kClipName[a_clip], ModeName(mode));
+				return;
+			}
+			switch (a_clip) {
+			case kDTOn:
+				Stage1(a_actor);
+				DTOnVFX(a_actor);
+				break;
+			case kSDTOn:
+				Stage2(a_actor);
+				SDTOnVFX(a_actor);
+				break;
+			default:
+				Stage0(a_actor, true);
+				break;
+			}
+			return;
+		}
 		switch (a_clip) {
 		case kDTOn:
-			Has(a_actor, g.mode[0]) ? Stage0(a_actor) : Stage1(a_actor);
-			Cast(a_actor, g.vfx2);
-			RE::ShakeCamera(0.5f, a_actor->GetPosition(), 0.5f);
-			Cast(a_actor, g.vfxExp);
+			mode == 0 ? Stage0(a_actor) : Stage1(a_actor);
+			DTOnVFX(a_actor);
 			break;
 		case kSDTOn:
-			Has(a_actor, g.mode[1]) ? Stage0(a_actor) : Stage2(a_actor);
-			Cast(a_actor, g.vfx1);
-			CastLater(id, 400, g.vfx2, 1.0f);
-			CastLater(id, 700, g.vfxExp);
-			CastLater(id, 1000, g.vfx3);
+			mode == 1 ? Stage0(a_actor) : Stage2(a_actor);
+			SDTOnVFX(a_actor);
 			break;
 		default:  // DT off, SDT off
 			Stage0(a_actor, true);
 			break;
 		}
+	}
+
+	// ===== Press -> transition (player, shout C; main thread) =====
+
+	int           g_reqClip = -1;  // the clip the current press asks for (Clip), -1 none
+	std::uint32_t g_reqPress = 0;  // that press (g_press)
+	int           g_retries = 0;   // RetryExhale calls of that press
+	constexpr int kMaxRetries = 3;
+	constexpr int kRetryMs = 120;
+
+	void SendExhale(std::uint32_t a_press);
+	void RetryExhale(std::uint32_t a_press, const char* a_why);
+
+	// the user's table: SDT: tap -> DT, hold -> base; DT: tap -> base, hold -> SDT; neither: tap -> DT, hold -> SDT
+	int TransitionFor(int a_mode, bool a_hold)
+	{
+		switch (a_mode) {
+		case 1:
+			return a_hold ? kSDTOff : kDTOn;
+		case 0:
+			return a_hold ? kSDTOn : kDTOff;
+		default:
+			return a_hold ? kSDTOn : kDTOn;
+		}
+	}
+
+	// exactly the current request marker on the player (none for -1)
+	void ApplyRequest(RE::Actor* a_player)
+	{
+		for (auto* effect : g.request) {
+			DispelAll(a_player, effect);
+		}
+		if (g_reqClip >= 0) {
+			Cast(a_player, g.requestSpell[g_reqClip]);
+		}
+	}
+
+	// the press is decided (a_hold false: released before the threshold, true: threshold reached): request marker for the
+	// transition from the current mode, then (a frame later, so the marker is on) the exhale into the graph. The graph's shout
+	// state then plays the exhale clip, which OAR replaces by the requested section. Calls of an older press are dropped.
+	void DecidePress(std::uint32_t a_press, bool a_hold)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player || a_press != g_press.load() || player->selectedPower != g.shoutC) {
+			return;
+		}
+		const int mode = ModeOf(player);
+		g_reqClip = TransitionFor(mode, a_hold);
+		g_reqPress = a_press;
+		ApplyRequest(player);
+		g_retries = 0;
+		REX::INFO("hold shout: {} in {} -> {} clip", a_hold ? "hold" : "tap", ModeName(mode), kClipName[g_reqClip]);
+		Later(30, [a_press]() { SendExhale(a_press); });
+	}
+
+	// main thread: the engine's own events for a released shout (shoutStart again in case a cut left the graph outside the shout
+	// state). Refused = the graph still sits in a shout exhale (an untracked or wrong clip, 2026-11-26 02:17 log: every press in
+	// DT refused for seconds): RetryExhale.
+	void SendExhale(std::uint32_t a_press)
+	{
+		auto* p = RE::PlayerCharacter::GetSingleton();
+		if (!p || a_press != g_press.load() || g_reqPress != a_press || g_reqClip < 0) {
+			return;
+		}
+		const bool  start = p->NotifyAnimationGraph("shoutStart");
+		const char* exhale = p->IsWeaponDrawn() ? "CombatReady_BreathExhaleShort" : "MT_BreathExhaleShort";
+		const bool  ok = p->NotifyAnimationGraph(exhale);
+		REX::INFO("hold shout: shoutStart {}, {} {}", start ? "accepted" : "refused", exhale, ok ? "accepted" : "refused");
+		if (!ok) {
+			RetryExhale(a_press, "exhale refused");
+		}
+	}
+
+	// main thread: the press's exhale didn't start its requested clip: leave the shout state (shoutStop), then try again once the
+	// graph is out (OAR re-evaluates an echoed clip: replaceOnEcho in the four sections). At most kMaxRetries per press.
+	void RetryExhale(std::uint32_t a_press, const char* a_why)
+	{
+		auto* p = RE::PlayerCharacter::GetSingleton();
+		if (!p || a_press != g_press.load()) {
+			return;
+		}
+		if (++g_retries > kMaxRetries) {
+			REX::WARN("hold shout: {}; gave up after {} retries", a_why, kMaxRetries);
+			return;
+		}
+		const bool stop = p->NotifyAnimationGraph("shoutStop");
+		REX::INFO("hold shout: {}; shoutStop {}, retry {} in {} ms", a_why, stop ? "accepted" : "refused", g_retries, kRetryMs);
+		Later(kRetryMs, [a_press]() { SendExhale(a_press); });
 	}
 
 	// runs the clip's payload once: at the payload time or when the clip ends, whichever comes first
@@ -800,25 +862,51 @@ namespace
 		if (!actor || actor->IsDead()) {
 			return;
 		}
-		REX::INFO("{} {:08X}: {} clip {}", Name(actor), a_actor, kClipName[it->second.clip], a_when);
-		RunPayload(actor, it->second.clip);
+		if (actor->IsPlayerRef() && g_playerClip) {
+			g_playerClipFired = true;  // from now on a new shout press cuts the clip
+		}
+		REX::INFO("{} {:08X}: {} clip {}{}", Name(actor), a_actor, kClipName[it->second.clip], a_when,
+			it->second.request ? " (requested)" : "");
+		RunPayload(actor, it->second.clip, it->second.request);
 	}
 
 	// main thread: a clip marker came on (a_fromSave: restored by a save load); schedules the payload
 	void ClipStarted(RE::FormID a_actor, int a_clip, bool a_fromSave)
 	{
+		auto* actor = RE::TESForm::LookupByID<RE::Actor>(a_actor);
+		if (!actor) {
+			return;
+		}
+		const bool playerC = actor->IsPlayerRef() && actor->selectedPower == g.shoutC;
+		bool       request = playerC && Has(actor, g.request[a_clip]);  // a save restores the request marker with the clip
 		if (!a_fromSave) {
-			auto* actor = RE::TESForm::LookupByID<RE::Actor>(a_actor);
-			if (!actor || !ShoutClipAllowed(actor, kClipName[a_clip])) {
+			if (playerC) {
+				// only the clip the current press asked for (a cut clip that restarts, or a section switch, doesn't count)
+				request = a_clip == g_reqClip && g_reqPress == g_press.load();
+				if (!request) {
+					REX::INFO("hold shout: {} clip doesn't match the request ({}); ignored", kClipName[a_clip],
+						g_reqClip >= 0 ? kClipName[g_reqClip] : "none");
+					// the press is decided but a wrong clip plays (OAR kept an old replacement): it would hold the shout
+					// state for its whole length, refusing every press. Cut it and send the exhale again.
+					if (g_reqClip >= 0 && g_reqPress == g_press.load()) {
+						RetryExhale(g_reqPress, "wrong clip");
+					}
+					return;
+				}
+			}
+			if (!ShoutClipAllowed(actor, kClipName[a_clip])) {
 				return;
 			}
 		}
 		const auto token = ++g_clipToken;
-		g_clips[a_actor] = { a_clip, token, false };
+		g_clips[a_actor] = { a_clip, token, false, request, request ? g_reqPress : 0 };
+		if (actor->IsPlayerRef()) {
+			g_playerClipFired = false;
+			g_playerClip = true;
+		}
 		if (a_fromSave) {
-			if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(a_actor)) {
-				REX::INFO("{} {:08X}: {} clip marker came from the save; stage runs at the payload time", Name(actor), a_actor, kClipName[a_clip]);
-			}
+			REX::INFO("{} {:08X}: {} clip marker came from the save; stage runs at the payload time", Name(actor), a_actor,
+				kClipName[a_clip]);
 		}
 		Later(kPayloadMs[a_clip], [a_actor, token]() { FireClip(a_actor, token, "at the payload time"); });
 	}
@@ -826,12 +914,23 @@ namespace
 	// main thread: the clip marker went off (clip over or interrupted)
 	void ClipEnded(RE::FormID a_actor, int a_clip)
 	{
-		if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(a_actor); actor && actor->IsPlayerRef()) {
-			DispelAll(actor, g.hold);  // the shout's choice is used up
-		}
 		auto it = g_clips.find(a_actor);
-		if (it != g_clips.end() && it->second.clip == a_clip) {
-			FireClip(a_actor, it->second.token, "ended early");
+		if (it == g_clips.end() || it->second.clip != a_clip) {
+			return;
+		}
+		FireClip(a_actor, it->second.token, "ended early");
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (a_actor != player->GetFormID()) {
+			return;
+		}
+		// the player's clip is over: its own request is used up; a newer press's request (it cut this clip) stays
+		const bool own = it->second.request && it->second.press == g_reqPress;
+		g_clips.erase(a_actor);
+		g_playerClip = false;
+		g_playerClipFired = false;
+		if (own) {
+			g_reqClip = -1;
+			ApplyRequest(player);
 		}
 	}
 
@@ -966,15 +1065,90 @@ namespace
 		static inline REL::Relocation<decltype(thunk)> func;
 	};
 
-	// ShoutHandler::CanProcess (VTABLE_ShoutHandler, slot 1): held events of the shout button are dropped while g_blocking
-	// (one transformation per key press). Down and up events always pass.
+	// main thread, at a press while the player's transformation clip still plays after its stage ran (DMC-style: the next
+	// input is taken as soon as the transformation is done): shoutStop into the graph leaves the shout state the way the exhale
+	// clip's own end trigger does, so the clip stops (OAR's marker goes off -> ClipEnded) and the press can start its own.
+	void CutClipForPress()
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) {
+			return;
+		}
+		const bool accepted = player->NotifyAnimationGraph("shoutStop");
+		REX::INFO("hold shout: press during the clip after its stage: clip cut (shoutStop {})", accepted ? "accepted" : "refused");
+	}
+
+	// main thread: a new press (not ignored): cut a running clip, else start the inhale like the engine does at a shout press
+	void PressDown(std::uint32_t a_press, bool a_cut)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player || a_press != g_press.load()) {
+			return;
+		}
+		if (a_cut) {
+			CutClipForPress();
+			return;
+		}
+		const bool ok = player->NotifyAnimationGraph("shoutStart");
+		REX::INFO("hold shout: pressed in {}, shoutStart {}", ModeName(ModeOf(player)), ok ? "accepted" : "refused");
+	}
+
+	// Input thread, shout button with shout C equipped. The engine never gets these events (the hook returns false): shout C
+	// is driven by the DLL alone, through the graph events the engine would send (shoutStart at the press, the exhale at the
+	// decision). So no voice state, no recovery, no auto-release at the last word, and the request is always on before the
+	// exhale. (Using the engine's shout: presses during a clip were refused until the clip's end, a cut needed the voice state
+	// reset, which left the shout greyed out or gone from the magic menu, and a cut clip restarted at the next shoutStart.)
+	void OnShoutButton(RE::ButtonEvent* a_button)
+	{
+		const float held = a_button->HeldDuration();
+		if (a_button->IsDown()) {
+			g_keyDown = true;
+			g_marked = false;
+			if (g_playerClip && !g_playerClipFired) {
+				g_deadPress = true;
+				REX::INFO("hold shout: pressed during a transformation clip before its stage; ignored");
+				return;
+			}
+			g_deadPress = false;
+			const auto press = ++g_press;
+			const bool cut = g_playerClip.load();
+			SKSE::GetTaskInterface()->AddTask([press, cut]() { PressDown(press, cut); });
+			return;
+		}
+		if (g_deadPress) {
+			if (a_button->IsUp()) {
+				g_keyDown = false;
+				g_deadPress = false;
+				REX::INFO("hold shout: released after {:.2f} s (ignored press)", held);
+			}
+			return;
+		}
+		const auto press = g_press.load();
+		if (a_button->IsHeld() && !g_marked && held >= HoldSeconds()) {
+			g_marked = true;
+			REX::INFO("hold shout: held {:.2f} s", held);
+			SKSE::GetTaskInterface()->AddTask([press]() { DecidePress(press, true); });
+		} else if (a_button->IsUp()) {
+			g_keyDown = false;
+			REX::INFO("hold shout: released after {:.2f} s", held);
+			if (!g_marked) {
+				g_marked = true;
+				SKSE::GetTaskInterface()->AddTask([press]() { DecidePress(press, false); });
+			}
+		}
+	}
+
+	// ShoutHandler::CanProcess (VTABLE_ShoutHandler, slot 1): runs before the handler takes the event. The player's shout C
+	// button events go to OnShoutButton only.
 	struct ShoutHandlerCanProcess
 	{
 		static bool thunk(RE::ShoutHandler* a_this, RE::InputEvent* a_event)
 		{
-			if (g_blocking && a_event) {
-				if (auto* button = a_event->AsButtonEvent(); button && button->IsHeld() &&
-															 button->QUserEvent() == RE::UserEvents::GetSingleton()->shout) {
+			if (auto* button = a_event ? a_event->AsButtonEvent() : nullptr;
+				g_ready && button && button->QUserEvent() == RE::UserEvents::GetSingleton()->shout) {
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				if (player && player->selectedPower == g.shoutC) {
+					OnShoutButton(button);
 					return false;
 				}
 			}
@@ -1172,8 +1346,10 @@ namespace Transform
 		g.words[1] = Lookup<RE::TESWordOfPower>(0x828, kPlugin, ok);
 		g.words[2] = Lookup<RE::TESWordOfPower>(0x829, kPlugin, ok);
 		g.shoutC = Lookup<RE::TESShout>(0x826, kPlugin, ok);
-		g.hold = Lookup<RE::EffectSetting>(0x869, kPlugin, ok);
-		g.holdSpell = Lookup<RE::SpellItem>(0x86A, kPlugin, ok);
+		for (int i = 0; i < 4; ++i) {  // esp\cancel_markers.py fifth run: MGEF 0x877 + 2i, SPEL 0x878 + 2i, in Clip order
+			g.request[i] = Lookup<RE::EffectSetting>(0x877 + 2 * i, kPlugin, ok);
+			g.requestSpell[i] = Lookup<RE::SpellItem>(0x878 + 2 * i, kPlugin, ok);
+		}
 		// optional: JCE sounds/explosion (master of the ESP, so normally present), legacy armors
 		bool optional = true;
 		g.uiActi = Lookup<RE::TESForm>(0x8E9, kJCE, optional);
@@ -1190,11 +1366,8 @@ namespace Transform
 		auto* events = RE::ScriptEventSourceHolder::GetSingleton();
 		events->AddEventSink<RE::TESDeathEvent>(EventSink::GetSingleton());
 		events->AddEventSink<RE::TESCellAttachDetachEvent>(EventSink::GetSingleton());
-		if (auto* input = RE::BSInputDeviceManager::GetSingleton()) {
-			input->AddEventSink<RE::InputEvent*>(InputSink::GetSingleton());
-		}
 		g_ready = true;
-		HoldSeconds();  // logs the thresholds
+		LogHoldSeconds("load");
 		REX::INFO("transform: ready");
 		return true;
 	}
@@ -1218,7 +1391,10 @@ namespace Transform
 
 	void SetHoldSeconds(float a_seconds)
 	{
-		g_holdSeconds = a_seconds > 0.0f ? a_seconds : 0.25f;
+		const float seconds = a_seconds > 0.0f ? a_seconds : 0.25f;
+		if (g_holdSeconds.exchange(seconds) != seconds && g_ready) {
+			LogHoldSeconds("setting changed");
+		}
 	}
 
 	void OutOfMagicka(RE::FormID a_actor, int a_mode)
@@ -1243,8 +1419,12 @@ namespace Transform
 		++g_epoch;
 		g_appliedScale.clear();
 		g_keyDown = false;
-		g_blocking = false;
 		g_pressFired = UINT32_MAX;
+		g_playerClip = false;
+		g_playerClipFired = false;
+		g_deadPress = false;
+		g_reqClip = -1;
+		g_retries = 0;
 		{
 			std::scoped_lock lock(g_markerLock);
 			g_markers.clear();

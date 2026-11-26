@@ -3,7 +3,7 @@ includes("lib/commonlibsse")
 
 -- set project constants
 set_project("DanteDevilTrigger")
-set_version("2.0.0")
+set_version("2.0.1")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
@@ -35,13 +35,7 @@ target("DanteDevilTrigger")
         end
     end)
 
-    -- the PDB (~21 MB) stays in build\ (attach it to a GitHub release); the commonlibsse rule also installs it next to the DLL
-    after_install(function(target)
-        local installdir = target:installdir()
-        if installdir then
-            os.tryrm(path.join(installdir, "SKSE", "Plugins", path.filename(target:symbolfile())))
-        end
-    end)
+    -- the commonlibsse rule installs the PDB (~21 MB) next to the DLL: shipped with the mod, so crash logs show symbol names
 
     -- add src files
     add_files("src/**.cpp")

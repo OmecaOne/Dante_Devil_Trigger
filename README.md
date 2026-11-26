@@ -1,7 +1,7 @@
 # Dante's Devil Trigger (SKSE plugin)
 
 Source of `DanteDevilTrigger.dll`, the SKSE plugin of
-[Dante's Devil Trigger](https://www.nexusmods.com/skyrimspecialedition/mods/103644) on Nexus Mods (version 2.0).
+[Dante's Devil Trigger](https://www.nexusmods.com/skyrimspecialedition/mods/103644) on Nexus Mods (version 2.0.1).
 The plugin implements the mod natively (no Papyrus scripts): Devil Trigger / Sin Devil Trigger transformations,
 magicka cost, customizable buffs (SKSEmenu entry added), and the shout and its words on game load. 'The Luce' 
 scripts in the original were needed for YRM's Devil Sword Dante moveset and have also been ported.
@@ -33,7 +33,7 @@ xmake
 
 The DLL and PDB end up in `build\windows\x64\releasedbg\`.
 If the environment variable `XSE_TES5_MODS_PATH` points to a mod manager's `mods` folder, `xmake install`
-copies the DLL into the mod folder `Dante's Devil Trigger` there (another name: `xmake f --mod_name="<name>"`).
+copies the DLL and PDB into the mod folder `Dante's Devil Trigger` there (another name: `xmake f --mod_name="<name>"`).
 
 ## Layout
 | File | Contents |
